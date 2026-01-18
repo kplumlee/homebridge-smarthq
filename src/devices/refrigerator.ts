@@ -475,6 +475,25 @@ export class SmartHQRefrigerator extends deviceBase {
       this.debugLog(`Temperature parse error: ${parseError}`)
     }
 
+    // Case 3: Some appliances return hex byte pairs (fridge+freezer) like "0A14" or "0000FF".
+    // Decode hex pairs into signed bytes (compatible with simbaja/gehome FridgeSetPointsConverter).
+    try {
+      const hex = r.replace(/^0x/, '')
+      if (/^[0-9a-f]+$/i.test(hex) && hex.length >= 4) {
+        const fridgeHex = hex.substring(0, 2)
+        const freezerHex = hex.substring(2, 4)
+        const fridgeVal = Number.parseInt(fridgeHex, 16)
+        const freezerVal = Number.parseInt(freezerHex, 16)
+        const fridgeSigned = fridgeVal > 128 ? fridgeVal - 256 : fridgeVal
+        const freezerSigned = freezerVal > 128 ? freezerVal - 256 : freezerVal
+        const value = compartment === 'fridge' ? fridgeSigned : freezerSigned
+        this.debugLog(`${compartment} temperature (hex bytes): ${value}° from ${hex}`)
+        return value
+      }
+    } catch (hexError) {
+      this.debugLog(`Temperature hex-parse error: ${hexError}`)
+    }
+
     return undefined
   }
 
@@ -508,6 +527,24 @@ export class SmartHQRefrigerator extends deviceBase {
       }
     } catch (parseError) {
       this.debugLog(`Setpoint parse error: ${parseError}`)
+    }
+
+    // Case 3: hex byte-pair encoding like "0A14" or "2500" (hex). Decode similarly to gehome.
+    try {
+      const hex = r.replace(/^0x/, '')
+      if (/^[0-9a-f]+$/i.test(hex) && hex.length >= 4) {
+        const fridgeHex = hex.substring(0, 2)
+        const freezerHex = hex.substring(2, 4)
+        const fridgeVal = Number.parseInt(fridgeHex, 16)
+        const freezerVal = Number.parseInt(freezerHex, 16)
+        const fridgeSigned = fridgeVal > 128 ? fridgeVal - 256 : fridgeVal
+        const freezerSigned = freezerVal > 128 ? freezerVal - 256 : freezerVal
+        const value = compartment === 'fridge' ? fridgeSigned : freezerSigned
+        this.debugLog(`${compartment} setpoint (hex bytes): ${value}° from ${hex}`)
+        return value
+      }
+    } catch (hexError) {
+      this.debugLog(`Setpoint hex-parse error: ${hexError}`)
     }
 
     return undefined
