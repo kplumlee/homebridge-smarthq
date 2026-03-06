@@ -60,6 +60,14 @@ export class SmartHQPlatform implements DynamicPlatformPlugin {
   debugMode!: boolean
   version!: string
 
+  private wsConnection: ws | null = null
+  private wsKeepaliveInterval: ReturnType<typeof setInterval> | null = null
+  private wsReconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private refreshTokenTimer: ReturnType<typeof setTimeout> | null = null
+  private wsReconnectAttempts = 0
+  private readonly wsMaxReconnectAttempts = 10
+  private isShuttingDown = false
+
   constructor(
     log: Logging,
     config: SmartHQPlatformConfig,
@@ -117,6 +125,19 @@ export class SmartHQPlatform implements DynamicPlatformPlugin {
         await this.discoverDevices()
       } catch (e: any) {
         await this.errorLog(`Failed to Discover Devices ${JSON.stringify(e.message ?? e)}`)
+      }
+    })
+
+    this.api.on('shutdown', () => {
+      this.isShuttingDown = true
+      this.cleanupWebsocket()
+      if (this.refreshTokenTimer) {
+        clearTimeout(this.refreshTokenTimer)
+        this.refreshTokenTimer = null
+      }
+      if (this.wsReconnectTimer) {
+        clearTimeout(this.wsReconnectTimer)
+        this.wsReconnectTimer = null
       }
     })
   }
@@ -178,7 +199,7 @@ export class SmartHQPlatform implements DynamicPlatformPlugin {
 
                 // Schedule next refresh
                 if (this.tokenSet.expires_in) {
-                  setTimeout(this.startRefreshTokenLogic.bind(this), 1000 * (this.tokenSet.expires_in - 2000))
+                  this.refreshTokenTimer = setTimeout(this.startRefreshTokenLogic.bind(this), 1000 * (this.tokenSet.expires_in - 2000))
                 }
                 return // Successfully recovered
               }
@@ -209,10 +230,117 @@ export class SmartHQPlatform implements DynamicPlatformPlugin {
     }
 
     if (this.tokenSet.expires_in) {
-      setTimeout(this.startRefreshTokenLogic.bind(this), 1000 * (this.tokenSet.expires_in - 2000))
+      this.refreshTokenTimer = setTimeout(this.startRefreshTokenLogic.bind(this), 1000 * (this.tokenSet.expires_in - 2000))
     } else {
       throw new Error('Token expiration time is undefined')
     }
+  }
+
+  private cleanupWebsocket() {
+    if (this.wsKeepaliveInterval) {
+      clearInterval(this.wsKeepaliveInterval)
+      this.wsKeepaliveInterval = null
+    }
+    if (this.wsConnection) {
+      this.wsConnection.removeAllListeners()
+      if (this.wsConnection.readyState === ws.OPEN || this.wsConnection.readyState === ws.CONNECTING) {
+        this.wsConnection.close()
+      }
+      this.wsConnection = null
+    }
+  }
+
+  private scheduleWebsocketReconnect() {
+    if (this.isShuttingDown) return
+    if (this.wsReconnectAttempts >= this.wsMaxReconnectAttempts) {
+      this.errorLog(`Websocket reconnection failed after ${this.wsMaxReconnectAttempts} attempts. Restart the plugin to retry.`)
+      return
+    }
+    const delay = Math.min(1000 * Math.pow(2, this.wsReconnectAttempts), 60000)
+    this.wsReconnectAttempts++
+    this.warnLog?.(`Websocket disconnected. Reconnecting in ${delay / 1000}s (attempt ${this.wsReconnectAttempts}/${this.wsMaxReconnectAttempts})...`)
+    this.wsReconnectTimer = setTimeout(async () => {
+      try {
+        await this.connectWebsocket()
+      } catch (e: any) {
+        this.errorLog(`Websocket reconnection failed: ${e.message ?? e}`)
+        this.scheduleWebsocketReconnect()
+      }
+    }, delay)
+  }
+
+  private async connectWebsocket() {
+    this.cleanupWebsocket()
+
+    const wssData = await axios.get('/websocket', { timeout: 15000 })
+    const connection = new ws(wssData.data.endpoint)
+    this.wsConnection = connection
+
+    connection.on('message', (data) => {
+      let obj: any
+      try {
+        obj = JSON.parse(data.toString())
+      } catch {
+        this.debugLog(`Received malformed websocket message: ${data.toString().substring(0, 200)}`)
+        return
+      }
+      this.debugLog(`data: ${JSON.stringify(obj)}`)
+
+      if (obj.kind === 'publish#erd' && obj.item?.applianceId && obj.item?.erd) {
+        const accessory = find(this.accessories, a => a.context.device.applianceId === obj.item.applianceId)
+
+        if (!accessory) {
+          return
+        }
+
+        if (ERD_CODES[obj.item.erd]) {
+          this.debugLog(`ERD_CODES: ${ERD_CODES[obj.item.erd]}`)
+          this.debugLog(`obj>item>value: ${obj.item.value}`)
+
+          if (obj.item.erd === ERD_TYPES.UPPER_OVEN_LIGHT) {
+            const service = accessory.getService('Upper Oven Light')
+            if (service) {
+              service.updateCharacteristic(this.Characteristic.On, obj.item.value === '01')
+            }
+          }
+        }
+      }
+    })
+
+    connection.on('close', () => {
+      this.debugLog('Websocket connection closed')
+      this.cleanupWebsocket()
+      this.scheduleWebsocketReconnect()
+    })
+
+    connection.on('error', (err) => {
+      this.errorLog(`Websocket error: ${err.message}`)
+    })
+
+    connection.on('open', () => {
+      this.wsReconnectAttempts = 0
+      this.successLog?.('Websocket connected')
+
+      connection.send(
+        JSON.stringify({
+          kind: 'websocket#subscribe',
+          action: 'subscribe',
+          resources: ['/appliance/*/erd/*'],
+        }),
+      )
+
+      this.wsKeepaliveInterval = setInterval(() => {
+        if (connection.readyState === ws.OPEN) {
+          connection.send(
+            JSON.stringify({
+              kind: 'websocket#ping',
+              id: 'keepalive-ping',
+              action: 'ping',
+            }),
+          )
+        }
+      }, KEEPALIVE_TIMEOUT)
+    })
   }
 
   /**
@@ -240,62 +368,7 @@ export class SmartHQPlatform implements DynamicPlatformPlugin {
       }
 
       try {
-        const wssData = await axios.get('/websocket')
-
-        const connection = new ws(wssData.data.endpoint)
-
-        connection.on('message', (data) => {
-          const obj = JSON.parse(data.toString())
-          this.debugLog(`data: ${JSON.stringify(obj)}`)
-
-          if (obj.kind === 'publish#erd') {
-            const accessory = find(this.accessories, a => a.context.device.applianceId === obj.item.applianceId)
-
-            if (!accessory) {
-              this.infoLog('Device not found in my list. Maybe we should rerun this plugin?')
-              return
-            }
-
-            if (ERD_CODES[obj.item.erd]) {
-              this.debugLog(`ERD_CODES: ${ERD_CODES[obj.item.erd]}`)
-              this.debugLog(`obj>item>value: ${obj.item.value}`)
-
-              if (obj.item.erd === ERD_TYPES.UPPER_OVEN_LIGHT) {
-                const service = accessory.getService('Upper Oven Light')
-                if (service) {
-                  service.updateCharacteristic(this.Characteristic.On, obj.item.value === '01')
-                }
-              }
-            }
-          }
-        })
-
-        connection.on('close', (_, reason) => {
-          this.debugLog('Connection closed')
-          this.debugLog(`reason: ${reason.toString()}`)
-        })
-
-        connection.on('open', () => {
-          connection.send(
-            JSON.stringify({
-              kind: 'websocket#subscribe',
-              action: 'subscribe',
-              resources: ['/appliance/*/erd/*'],
-            }),
-          )
-
-          setInterval(
-            () =>
-              connection.send(
-                JSON.stringify({
-                  kind: 'websocket#ping',
-                  id: 'keepalive-ping',
-                  action: 'ping',
-                }),
-              ),
-            KEEPALIVE_TIMEOUT,
-          )
-        })
+        await this.connectWebsocket()
       } catch (e: any) {
         await this.errorLog(`discoverDevices, Failed to get Websocket Data, Error Message: ${e.message ?? e}, Submit Bugs Here: https://bit.ly/smarthq-bug-report`)
       }
