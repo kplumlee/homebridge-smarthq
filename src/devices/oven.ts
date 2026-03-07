@@ -98,7 +98,7 @@ export class SmartHQOven extends deviceBase {
   }
 
   async readErd(erd: string): Promise<string> {
-    const d = await axios.get(`/appliance/${this.accessory.context.device.applianceId}/erd/${erd}`)
+    const d = await axios.get(`/appliance/${this.accessory.context.device.applianceId}/erd/${erd}`, { timeout: 10000 })
     return String(d.data.value)
   }
 
@@ -109,7 +109,7 @@ export class SmartHQOven extends deviceBase {
       applianceId: this.accessory.context.device.applianceId,
       erd,
       value: typeof value === 'boolean' ? (value ? '01' : '00') : value,
-    })
+    }, { timeout: 10000 })
     return undefined
   }
 }

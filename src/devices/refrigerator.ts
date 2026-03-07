@@ -51,11 +51,11 @@ export class SmartHQRefrigerator extends deviceBase {
         try {
           const r = await this.readErd(ERD_TYPES.CURRENT_TEMPERATURE)
           // CURRENT_TEMPERATURE returns a byte array: byte 0 = fridge temp (°F), byte 1 = freezer temp (°F)
-          // Need to convert from hex string to get first byte
           const bytes = r.match(/.{1,2}/g) || []
           const fridgeTemp = bytes[0] ? Number.parseInt(bytes[0], 16) : 0
-          // Convert Fahrenheit to Celsius for HomeKit
-          return (fridgeTemp - 32) * 5 / 9
+          // Convert Fahrenheit to Celsius and clamp to HomeKit range (-270 to 100)
+          const celsius = (fridgeTemp - 32) * 5 / 9
+          return Math.min(Math.max(celsius, -270), 100)
         } catch (error: any) {
           this.warnLog?.(`Fridge Temperature readErd error: ${error?.message ?? error}`)
           return 0
@@ -73,8 +73,9 @@ export class SmartHQRefrigerator extends deviceBase {
           // CURRENT_TEMPERATURE returns a byte array: byte 0 = fridge temp (°F), byte 1 = freezer temp (°F)
           const bytes = r.match(/.{1,2}/g) || []
           const freezerTemp = bytes[1] ? Number.parseInt(bytes[1], 16) : 0
-          // Convert Fahrenheit to Celsius for HomeKit
-          return (freezerTemp - 32) * 5 / 9
+          // Convert Fahrenheit to Celsius and clamp to HomeKit range (-270 to 100)
+          const celsius = (freezerTemp - 32) * 5 / 9
+          return Math.min(Math.max(celsius, -270), 100)
         } catch (error: any) {
           this.warnLog?.(`Freezer Temperature readErd error: ${error?.message ?? error}`)
           return 0
@@ -180,7 +181,7 @@ export class SmartHQRefrigerator extends deviceBase {
 
   async readErd(erd: string): Promise<string> {
     const d = await axios
-      .get(`/appliance/${this.accessory.context.device.applianceId}/erd/${erd}`)
+      .get(`/appliance/${this.accessory.context.device.applianceId}/erd/${erd}`, { timeout: 10000 })
     return String(d.data.value)
   }
 
@@ -192,7 +193,7 @@ export class SmartHQRefrigerator extends deviceBase {
         applianceId: this.accessory.context.device.applianceId,
         erd,
         value: typeof value === 'boolean' ? (value ? '01' : '00') : value,
-      })
+      }, { timeout: 10000 })
     return undefined
   }
 }
